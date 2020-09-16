@@ -7,47 +7,51 @@ using System.Text.RegularExpressions;
 using System.IO;
 using OfficeOpenXml;
 using System.Globalization;
-
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 //Nuget EPPlus and system.commandline.dragonfruit
 
-//two different types of input spreadsheets
+//two different types of input spreadsheets - see details below
 //1. newer format - 
-
 //2. older format - 
 namespace IPxact2XLS
 {
     ///<Summary>
-    /// Register Access Type
+    /// register Access Type
     ///</Summary>
     public enum AccessType { RW, R }; //read-write, read-only
 
     ///<Summary>
-    /// Field of Register
+    /// Field of register
     ///</Summary>
-    public class Field
+    public class field
     {
-        public string Name { get; set; }
-        public string Description { get; set; }
+        public string name { get; set; }
+        [JsonIgnore]
+        public string description { get; set; }
         public int bitOffset { get; set; }
-        public int resetValue { get; set; }      //in spririt format field does not have reset value; but can be calculated from register reset value; it exist in ipxact format
+        public int value { get; set; }      //in spririt format field does not have reset value; but can be calculated from register reset value; it exist in ipxact format
         public int bitWidth { get; set; }
+        [JsonIgnore]
         public AccessType Access { get; set; }
     }
     ///<Summary>
-    /// Register
+    /// register
     ///</Summary>
-    public class Register
+    public class register
     {
-        public string Name { get; set; }
-        public string Description { get; set; }
-        public string addressOffset { get; set; }
+        public string name { get; set; }
+        [JsonIgnore]
+        public string description { get; set; }
+        public int Offset { get; set; }
+        [JsonIgnore]
         public int resetValue { get; set; }
         //public string resetMask { get; set; }
-        public List<Field> Fields { get; set; }
-        public Register()
+        public List<field> fields { get; set; }
+        public register()
         {
-            Fields = new List<Field>();
+            fields = new List<field>();
             
         }
     }
@@ -134,21 +138,21 @@ namespace IPxact2XLS
             return fv;
         }
 
-        static int GetRegValueFromFields(Register r)
+        static int GetRegValueFromFields(register r)
         {
             int rv = 0;
-            foreach (var f in r.Fields)
+            foreach (var f in r.fields)
             {
-                rv += f.resetValue << f.bitOffset;
+                rv += f.value << f.bitOffset;
             }
 
             return rv;
         }
 
-        //newer format
-        static List<Register> ProcessXML_SNPS(XElement root)
+        //newer format - register have values; fields do not; fields get value from register
+        static List<register> ProcessXML_SNPS(XElement root)
         {
-            List<Register> phyregs = new List<Register>();
+            List<register> phyregs = new List<register>();
             //foreach(var x in root.Elements())
             //{
             //    Console.WriteLine(x.Name.LocalName);
@@ -157,6 +161,81 @@ namespace IPxact2XLS
             var ver = root.Elements().Where(x => x.Name.LocalName.Contains("version")).First().Value;
             Console.WriteLine("version " + ver);
 
+            var mmaps = root.Elements().Where(x => x.Name.LocalName.Contains("memoryMaps")).First();
+            var mmap = mmaps.Elements().First();
+            var addrBlock = mmap.Elements().First(x => x.Name.LocalName.Contains("addressBlock"));
+
+            //Console.WriteLine(addrBlock.Elements().Count());
+            var regs = addrBlock.Elements().Where(x => string.Compare(x.Name.LocalName, "register", StringComparison.OrdinalIgnoreCase) ==0 );  //all the registers
+            Console.WriteLine(regs.Count());
+            foreach (var z in regs)
+            {
+                //skip ROM/RAM register - name starts with RAWMEM_DIG_ROM or RAWMEM_DIG_RAM
+                var reg_name = z.Elements().First().Value;
+                //Debug.WriteLine(reg_name);
+
+                //var addr = z.Elements().First(x => x.Name.LocalName == "addressOffset").Value;
+                //char msb = addr.ToCharArray()[2];
+
+                if (!reg_name.StartsWith("RAWMEM_DIG_R"))
+                {
+                    var xr = new register();
+                    xr.name = reg_name;
+                    xr.description = z.Elements().First(x => x.Name.LocalName == "description").Value;
+                    xr.Offset = IntParse(z.Elements().First(x => x.Name.LocalName == "addressOffset").Value);
+                    xr.resetValue = IntParse(z.Elements().First(x => x.Name.LocalName == "reset").Elements().First().Value);
+                    //xr.resetMask = z.Elements().First(x => x.Name.LocalName == "reset").Elements().Last().Value;
+
+                    var fields = z.Elements().Where(x => x.Name.LocalName == "field");
+                    foreach (var f in fields)
+                    {
+                        var n = f.Elements().First(x => x.Name.LocalName == "name").Value;
+                        //description may not exist for some fields; must use FirstOrDefault()
+                        string d = f.Elements().FirstOrDefault(x => x.Name.LocalName == "description")?.Value ?? string.Empty;
+
+                        var offset = f.Elements().First(x => x.Name.LocalName == "bitOffset").Value;
+                        //var resets = f.Elements().First(x => x.Name.LocalName == "resets");
+                        //var resetvalue = resets.Descendants().First(x => x.Name.LocalName == "value").Value;
+                        var w = f.Elements().First(x => x.Name.LocalName == "bitWidth").Value;
+                        var acc = f.Elements().First(x => x.Name.LocalName == "access").Value;
+
+                        field ff = new field
+                        {
+                            name = n,
+                            description = d,
+                            bitOffset = int.Parse(offset),
+                            bitWidth = int.Parse(w)
+                        };
+                        ff.value = GetFieldValue(xr.resetValue, ff.bitOffset, ff.bitWidth);
+
+                        if (acc == "read-only")
+                        {
+                            ff.Access = AccessType.R;
+                        }
+                        else if (acc == "read-write")
+                        {
+                            ff.Access = AccessType.RW;
+                        }
+                        else
+                        {
+                            throw new Exception("unexpected access type for field " + n);
+                        }
+
+                        xr.fields.Add(ff);
+                    }
+                    phyregs.Add(xr);
+                }
+
+            }
+            return phyregs;
+        }
+
+
+        //older format - register have no values; fields have; registers get value from fields
+        static List<register> ProcessXML_IPXact(XElement root)
+        {
+            List<register> phyregs = new List<register>();
+            //var mmaps = root.Elements().Last();
             var mmaps = root.Elements().Where(x => x.Name.LocalName.Contains("memoryMaps")).First();
             var mmap = mmaps.Elements().First();
             var addrBlock = mmap.Elements().First(x => x.Name.LocalName.Contains("addressBlock"));
@@ -175,84 +254,10 @@ namespace IPxact2XLS
 
                 if (!reg_name.StartsWith("RAWMEM_DIG_R"))
                 {
-                    var xr = new Register();
-                    xr.Name = reg_name;
-                    xr.Description = z.Elements().First(x => x.Name.LocalName == "description").Value;
-                    xr.addressOffset = z.Elements().First(x => x.Name.LocalName == "addressOffset").Value;
-                    xr.resetValue = IntParse(z.Elements().First(x => x.Name.LocalName == "reset").Elements().First().Value);
-                    //xr.resetMask = z.Elements().First(x => x.Name.LocalName == "reset").Elements().Last().Value;
-
-                    var fields = z.Elements().Where(x => x.Name.LocalName == "field");
-                    foreach (var f in fields)
-                    {
-                        var n = f.Elements().First(x => x.Name.LocalName == "name").Value;
-                        //description may not exist for some fields; must use FirstOrDefault()
-                        string d = f.Elements().FirstOrDefault(x => x.Name.LocalName == "description")?.Value ?? string.Empty;
-
-                        var offset = f.Elements().First(x => x.Name.LocalName == "bitOffset").Value;
-                        //var resets = f.Elements().First(x => x.Name.LocalName == "resets");
-                        //var resetvalue = resets.Descendants().First(x => x.Name.LocalName == "value").Value;
-                        var w = f.Elements().First(x => x.Name.LocalName == "bitWidth").Value;
-                        var acc = f.Elements().First(x => x.Name.LocalName == "access").Value;
-
-                        Field ff = new Field
-                        {
-                            Name = n,
-                            Description = d,
-                            bitOffset = int.Parse(offset),
-                            bitWidth = int.Parse(w)
-                        };
-                        ff.resetValue = GetFieldValue(xr.resetValue, ff.bitOffset, ff.bitWidth);
-
-                        if (acc == "read-only")
-                        {
-                            ff.Access = AccessType.R;
-                        }
-                        else if (acc == "read-write")
-                        {
-                            ff.Access = AccessType.RW;
-                        }
-                        else
-                        {
-                            throw new Exception("unexpected access type for field " + n);
-                        }
-
-                        xr.Fields.Add(ff);
-                    }
-                    phyregs.Add(xr);
-                }
-
-            }
-            return phyregs;
-        }
-
-
-        //older format
-        static List<Register> ProcessXML_IPXact(XElement root)
-        {
-            List<Register> phyregs = new List<Register>();
-            var mmaps = root.Elements().Last();
-            var mmap = mmaps.Elements().First();
-            var addrBlock = mmap.Elements().First(x => x.Name.LocalName.Contains("addressBlock"));
-
-            //Console.WriteLine(addrBlock.Elements().Count());
-            var regs = addrBlock.Elements().Where(x => x.Name.LocalName == "register");  //all the registers
-            Console.WriteLine(regs.Count());
-            foreach (var z in regs)
-            {
-                //skip ROM/RAM register - name starts with RAWMEM_DIG_ROM or RAWMEM_DIG_RAM
-                var reg_name = z.Elements().First().Value;
-                //Debug.WriteLine(reg_name);
-
-                //var addr = z.Elements().First(x => x.Name.LocalName == "addressOffset").Value;
-                //char msb = addr.ToCharArray()[2];
-
-                if (!reg_name.StartsWith("RAWMEM_DIG_R"))
-                {
-                    var xr = new Register();
-                    xr.Name = reg_name;
-                    xr.Description = z.Elements().First(x => x.Name.LocalName == "description").Value;
-                    xr.addressOffset = z.Elements().First(x => x.Name.LocalName == "addressOffset").Value;
+                    var xr = new register();
+                    xr.name = reg_name;
+                    xr.description = z.Elements().First(x => x.Name.LocalName == "description").Value;
+                    xr.Offset = IntParse(z.Elements().First(x => x.Name.LocalName == "addressOffset").Value);
                     
 
                     var fields = z.Elements().Where(x => x.Name.LocalName == "field");
@@ -269,12 +274,12 @@ namespace IPxact2XLS
                         var w = f.Elements().First(x => x.Name.LocalName == "bitWidth").Value;
                         var acc = f.Elements().First(x => x.Name.LocalName == "access").Value;
 
-                        Field ff = new Field
+                        field ff = new field
                         {
-                            Name = n,
-                            Description = d,
+                            name = n,
+                            description = d,
                             bitOffset = int.Parse(offset),
-                            resetValue = resetvalue,        
+                            value = resetvalue,        
                            
                             bitWidth = int.Parse(w)
                         };
@@ -291,7 +296,7 @@ namespace IPxact2XLS
                             throw new Exception("unexpected access type for field " + n);
                         }
 
-                        xr.Fields.Add(ff);
+                        xr.fields.Add(ff);
                     }
 
                     //no "register" reset value in older format; only in fields; need to calculate
@@ -322,7 +327,7 @@ namespace IPxact2XLS
             }
             else
             {
-                List<Register> phyregs = new List<Register>();
+                List<register> phyregs = new List<register>();
                 try
                 {
                     XElement root;
@@ -359,7 +364,17 @@ namespace IPxact2XLS
                         Environment.Exit(0);
                     }
 
+
                     Console.WriteLine(phyregs.Count());
+                    //save to JSON
+                    string jsonfile = Path.GetFileNameWithoutExtension(fn) +  ".json";
+
+                    var options = new JsonSerializerOptions
+                    {
+                        WriteIndented = true
+                    };
+                    var jsonString = JsonSerializer.Serialize(phyregs, options);
+                    File.WriteAllText(jsonfile, jsonString);
 
 
                     //save to spreadsheet
@@ -383,9 +398,9 @@ namespace IPxact2XLS
                         worksheet.InsertRow(1, 1);
 
                         worksheet.Cells[1, 1].Value = "Offset";
-                        worksheet.Cells[1, 2].Value = "Register Name";
-                        worksheet.Cells[1, 3].Value = "Register Description";
-                        worksheet.Cells[1, 4].Value = "Register Value";
+                        worksheet.Cells[1, 2].Value = "register Name";
+                        worksheet.Cells[1, 3].Value = "register Description";
+                        worksheet.Cells[1, 4].Value = "register Value";
                         worksheet.Cells[1, 5].Value = "Field Name";
                         worksheet.Cells[1, 6].Value = "Bit Start";
                         worksheet.Cells[1, 7].Value = "Bit Width";
@@ -397,23 +412,23 @@ namespace IPxact2XLS
 
                         foreach (var r in phyregs)
                         {
-                            foreach (var f in r.Fields)
+                            foreach (var f in r.fields)
                             {
                                 worksheet.InsertRow(i, 1);
-                                worksheet.Cells[i, 1].Value = r.addressOffset.Replace("'h", "0x", StringComparison.OrdinalIgnoreCase); // "0x" + r.addressOffset.Substring(2);
-                                worksheet.Cells[i, 2].Value = r.Name;
-                                worksheet.Cells[i, 3].Value = r.Description;
+                                worksheet.Cells[i, 1].Value =  "0x" + r.Offset.ToString("X");
+                                worksheet.Cells[i, 2].Value = r.name;
+                                worksheet.Cells[i, 3].Value = r.description;
                                 worksheet.Cells[i, 4].Value = "0x" + r.resetValue.ToString("X");
                                 //worksheet.Cells[i, 5].Value = r.resetMask;
 
                                 //field
-                                worksheet.Cells[i, 5].Value = f.Name;
+                                worksheet.Cells[i, 5].Value = f.name;
                                 worksheet.Cells[i, 6].Value = f.bitOffset;
                                 worksheet.Cells[i, 7].Value = f.bitWidth;
                                 worksheet.Cells[i, 8].Value = f.Access;
-                                worksheet.Cells[i, 9].Value = "0x" + f.resetValue.ToString("X");
+                                worksheet.Cells[i, 9].Value = "0x" + f.value.ToString("X");
                                 
-                                worksheet.Cells[i, 10].Value = f.Description;
+                                worksheet.Cells[i, 10].Value = f.description;
                                 //
                                 i++;
                             }
@@ -429,5 +444,8 @@ namespace IPxact2XLS
                 }
             }
         }
+
+
+       
     }
 }
